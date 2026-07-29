@@ -1,10 +1,10 @@
 _base_ = ['mmdet3d::_base_/default_runtime.py']
 custom_imports = dict(
     imports=[
-        'unidet3d',  # 已有的导入项
-        'custom_hooks.save_above_threshold_hook'  # 新添加的导入项
+        'unidet3d',  
+        'custom_hooks.save_above_threshold_hook' 
     ],
-    allow_failed_imports=False  # 保持此设置不变
+    allow_failed_imports=False 
 )
 
 classes_scannet = ['cabinet', 'bed', 'chair', 'sofa', 'table', 'door', 'window', 'bookshelf',
@@ -52,7 +52,7 @@ model = dict(
         return_blocks=True),
     decoder=dict(
         type='UniDet3DEncoder',
-        num_layers=6,#原参数为6，修改为9
+        num_layers=6,
         datasets_classes=[classes_scannet],
         in_channels=num_channels,
         d_model=256,
@@ -719,7 +719,6 @@ optim_wrapper = dict(
 
 param_scheduler = dict(type='PolyLR', begin=0, end=1024, power=0.9)
 
-# 在配置文件中添加或修改
 custom_hooks = [
     dict(
         type='SaveAboveThresholdHook',
