@@ -38,8 +38,3 @@ We evaluate UniDet3D-Meta on six challenging indoor 3D object detection benchmar
 > - The significant boost in mAP₅₀ indicates enhanced precision for minority-class detection, validating our motivation.
 
 EOF
-
-# 提交并推送
-git add README.md
-git commit -m "Add main results table to README"
-git push origin master
