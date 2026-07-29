@@ -1,7 +1,7 @@
 _base_ = ['mmdet3d::_base_/default_runtime.py']
 custom_imports = dict(
     imports=[
-        'unidet3d'  # 确保包含新模型的 unidet3d.py 文件能被导入
+        'unidet3d' 
     ],
     allow_failed_imports=False
 )
@@ -101,7 +101,7 @@ model = dict(
         low_sp_thr=0.18,
         up_sp_thr=0.81,
         topk_insts=1000,
-        score_thr=0,#若需要更好的可视化，将其改为0.3,原文为0
+        score_thr=0,
         iou_thr=[0.5, 0.55, 0.55, 0.55, 0.55, 0.55]))
 
 # scannet dataset settings
@@ -714,13 +714,13 @@ test_evaluator = dict(type='IndoorMetric_',
                       datasets_classes=[classes_scannet, classes_s3dis, 
                                         classes_multiscan, classes_3rscan,
                                         classes_scannetpp, classes_arkitscenes],
-                      vis_dir='work_dirs/unidet3d_vis',   # ✅ 新增
+                      vis_dir='work_dirs/unidet3d_vis', 
                       )
 val_evaluator = test_evaluator
 
 optim_wrapper = dict(
     type='OptimWrapper',
-    optimizer=dict(type='AdamW', lr=0.0001 * 2, weight_decay=0.05),#用两张卡*4
+    optimizer=dict(type='AdamW', lr=0.0001 * 2, weight_decay=0.05),
     clip_grad=dict(max_norm=10, norm_type=2))
 
 param_scheduler = dict(type='PolyLR', begin=0, end=1024, power=0.9)
