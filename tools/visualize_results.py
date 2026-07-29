@@ -124,7 +124,6 @@ def main():
     # Visualize
     visualize_headless(result, points, args, args.scene_name)
 
-    print(f"可视化完成。文件在: {args.show_dir}")
 
 if __name__ == '__main__':
     main()
