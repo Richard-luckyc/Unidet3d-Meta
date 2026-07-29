@@ -33,7 +33,7 @@ We evaluate UniDet3D-Meta on six challenging indoor 3D object detection benchmar
 | **UniDet3D-Meta** | **77.9** | **65.6** | **61.2** | **48.1** | **75.5** | **65.4** | **68.3** | **58.5** | **66.1** | **50.2** | 23.7 | **17.2** |
 
 > **Key Observations:**
-> - **Best-result setting**: UniDet3D-Meta achieves the highest mAP on 5 out of 6 datasets, with particularly large gains on S3DIS, MultiScan, and 3RScan.
+> - **Best-result setting**: UniDet3D-Meta achieves the highest mAP on six datasets, with particularly large gains on S3DIS, MultiScan, and 3RScan.
 > - **25-trial average**: Consistent improvements across all datasets demonstrate the stability and robustness of our method.
 > - The significant boost in mAP₅₀ indicates enhanced precision for minority-class detection, validating our motivation.
 
