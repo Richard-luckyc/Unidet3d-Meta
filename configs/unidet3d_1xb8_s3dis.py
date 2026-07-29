@@ -1,8 +1,4 @@
-# config_unidet3d_meta_s3dis_with_load_and_save.py
-# !!! 警告：下面的 load_from 设置预计会因架构不匹配而导致 state_dict 错误 !!!
-# !!! 它仅为满足请求而保留，实际部分加载应使用 init_cfg+strict=False 或 train.py+--load-partial-from !!!
 
-# 基础设置和自定义导入
 _base_ = ['mmdet3d::_base_/default_runtime.py']
 custom_imports = dict(
     imports=[
@@ -12,7 +8,6 @@ custom_imports = dict(
     allow_failed_imports=False
 )
 
-# --- S3DIS 数据集定义 ---
 classes_s3dis_model = ['table', 'chair', 'sofa', 'bookcase', 'board']
 classes_s3dis_eval = [
     'ceiling', 'floor', 'wall', 'beam', 'column', 'window', 'door',
@@ -27,9 +22,7 @@ data_prefix_s3dis = dict(
     pts_semantic_mask='semantic_mask', sp_pts_mask='super_points')
 train_area = [1, 2, 3, 4, 6]
 test_area = 5
-# --- S3DIS 定义结束 ---
 
-# --- 模型设置 ---
 num_channels = 32
 voxel_size = 0.02
 
@@ -51,7 +44,7 @@ model = dict(
         return_blocks=True),
     decoder=dict(
         type='UniDet3DEncoder',
-        num_layers=6,#原参数为6，修改为9
+        num_layers=6,
         datasets_classes=[classes_s3dis_model],
         datasets=['s3dis'],
         angles=[False],
@@ -81,15 +74,12 @@ model = dict(
                      loss_rotated=dict(type='UniDet3DRotatedIoU3DLoss', mode='diou', reduction='none'))]
             )
         ),
-    # init_cfg=None, # 移除这一行，因为 load_from 会覆盖它
     train_cfg=dict(topk=6),
     test_cfg=dict(
         low_sp_thr=0.18, up_sp_thr=0.81, topk_insts=1000, score_thr=0,
         iou_thr=[0.55])
     )
-# --- 模型设置结束 ---
 
-# --- S3DIS Pipelines (保持不变) ---
 train_pipeline_s3dis = [
     dict(type='LoadPointsFromFile', coord_type='DEPTH', shift_height=False, use_color=True, load_dim=6, use_dim=[0, 1, 2, 3, 4, 5]),
     dict(type='LoadAnnotations3D_', with_label_3d=False, with_bbox_3d=False, with_mask_3d=True, with_seg_3d=True, with_sp_mask_3d=True),
@@ -110,9 +100,7 @@ test_pipeline_s3dis = [
              dict(type='NormalizePointsColor_', color_mean=[127.5, 127.5, 127.5])]),
     dict(type='Pack3DDetInputs_', keys=['points', 'sp_pts_mask'])
 ]
-# --- Pipeline 定义结束 ---
 
-# --- 数据加载器设置 (保持不变) ---
 train_dataloader = dict(
     batch_size=8, num_workers=8, persistent_workers=True,
     sampler=dict(type='DefaultSampler', shuffle=True),
@@ -131,41 +119,32 @@ val_dataloader = dict(
         metainfo=metainfo_s3dis, pipeline=test_pipeline_s3dis, test_mode=True,
         data_prefix=data_prefix_s3dis, box_type_3d='Depth'))
 test_dataloader = val_dataloader
-# --- 数据加载器设置结束 ---
 
-# --- 训练、验证、测试设置 ---
-
-# --- !!! 保留了你设置的 load_from，但这预计会失败 !!! ---
 load_from = 'autodl-tmp/work_dirs/tmp/epoch_880.pth'
-#原文load_from = 'autodl-tmp/work_dirs/tmp/oneformer3d_1xb4_scannet.pth'
 
-# --- 明确设置 resume = False (可以通过命令行 --resume 覆盖) ---
 resume = False
 
-# --- 评估器设置 (使用修正后的简单版本) ---
+
 val_evaluator = dict(
     type='IndoorMetric_',
     datasets=['s3dis'],
     datasets_classes=[classes_s3dis_model])
 test_evaluator = val_evaluator
-# --- 评估器设置结束 ---
 
-# --- 优化器、调度器设置 (保持不变) ---
 optim_wrapper = dict(
     type='OptimWrapper',
     optimizer=dict(type='AdamW', lr=0.0001 * 2, weight_decay=0.05),
     clip_grad=dict(max_norm=10, norm_type=2))
 
-param_scheduler = dict(type='PolyLR', begin=0, end=1024, power=0.9) # 确保 end 匹配 max_epochs
+param_scheduler = dict(type='PolyLR', begin=0, end=1024, power=0.9) 
 
 default_hooks = dict(
     checkpoint=dict(interval=1, max_keep_ckpts=16))
 
-# --- 训练循环设置 (保持不变) ---
+
 train_cfg = dict(
     type='EpochBasedTrainLoop',
-    max_epochs=96, # 可调整,原文为1024
-    dynamic_intervals=[(1, 8), (160 - 8, 1)]) # 可调整验证频率
+    max_epochs=96,
+    dynamic_intervals=[(1, 8), (160 - 8, 1)]) 
 val_cfg = dict(type='ValLoop')
 test_cfg = dict(type='TestLoop')
-# --- 训练、验证、测试设置结束 ---
