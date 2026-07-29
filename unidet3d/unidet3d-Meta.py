@@ -1,4 +1,5 @@
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 import spconv.pytorch as spconv
 from torch_scatter import scatter_mean
@@ -17,44 +18,91 @@ from mmdet3d.structures import rotation_3d_in_axis
 from .criterion import _bbox_to_loss
 from .structures import InstanceData_
 
-@MODELS.register_module()
-class UniDet3D(Base3DDetector):
-    r"""UniDet3D for unifed 3D object detection.
+# Meta Learning
+from torch.autograd import Variable
+import torch.nn.init as init
+def to_var(x, requires_grad=True):
+    if torch.cuda.is_available():
+        x = x.cuda()
+    return Variable(x, requires_grad=requires_grad)
 
-    Args:
-        in_channels (int): Number of input channels.
-        num_channels (int): Number of output channels.
-        voxel_size (float): Voxel size.
-        min_spatial_shape (int): Minimal shape for spconv tensor.
-        query_thr (float): We select min(query_thr, n_queries) queries
-            for training and testing.
-        use_superpoints (bool): Flag to indicate whether to use superpoints
-            for improved detection.
-        bbox_by_mask (bool): Whether to derive bounding boxes from masks.
-        target_by_distance (bool): Whether to use targets based on distance 
-            to bbox center.
-        fast_nms (bool): Flag for using fast Non-Maximum Suppression.
-        use_sync_bn (bool, optional): Flag to use synchronized 
-            batch normalization. Defaults to True.
-        backbone (ConfigDict, optional): Config dict of the backbone. 
-            Defaults to None.
-        decoder (ConfigDict, optional): Config dict of the decoder. 
-            Defaults to None.
-        criterion (ConfigDict, optional): Config dict of the criterion. 
-            Defaults to None.
-        train_cfg (dict, optional): Config dict of training hyper-parameters.
-            Defaults to None.
-        test_cfg (dict, optional): Config dict of test hyper-parameters. 
-            Defaults to None.
-        data_preprocessor (dict or ConfigDict, optional): The pre-process 
-            config of :class:BaseDataPreprocessor.
-            It usually includes:
-                - ``pad_size_divisor``
-                - ``pad_value``
-                - ``mean``
-                - ``std``.
-        init_cfg (dict or ConfigDict, optional): The config to control the 
-            initialization. Defaults to None.
+class MetaModule(nn.Module):
+    def params(self):
+        for name, param in self.named_params(self):
+            yield param
+
+    def named_leaves(self):
+        return []
+
+    def named_submodules(self):
+        return []
+
+    def named_params(self, curr_module=None, memo=None, prefix=''):
+        if memo is None:
+            memo = set()
+        if curr_module is None:
+            curr_module = self
+        if hasattr(curr_module, 'named_leaves'):
+            for name, p in curr_module.named_leaves():
+                if p is not None and p not in memo:
+                    memo.add(p)
+                    yield prefix + ('.' if prefix else '') + name, p
+        else:
+            for name, p in curr_module._parameters.items():
+                if p is not None and p not in memo:
+                    memo.add(p)
+                    yield prefix + ('.' if prefix else '') + name, p
+        for mname, module in curr_module.named_children():
+            submodule_prefix = prefix + ('.' if prefix else '') + mname
+            for name, p in self.named_params(module, memo, submodule_prefix):
+                yield name, p
+
+    def update_params(self, lr_inner, first_order=False, source_params=None, detach=False):
+        if source_params is not None:
+            for tgt, grad in zip(self.named_params(self), source_params):
+                name_t, param_t = tgt
+                if first_order:
+                    grad = to_var(grad.detach().data)
+                if grad is not None:
+                    tmp = param_t - lr_inner * grad
+                    self.set_param(self, name_t, tmp)
+        else:
+            for name, param in self.named_params(self):
+                if not detach:
+                    grad = param.grad
+                    if first_order:
+                        grad = to_var(grad.detach().data)
+                    tmp = param - lr_inner * grad
+                    self.set_param(self, name, tmp)
+                else:
+                    param = param.detach_()
+                    self.set_param(self, name, param)
+
+    def set_param(self, curr_mod, name, param):
+        if '.' in name:
+            n = name.split('.')
+            module_name = n[0]
+            rest = '.'.join(n[1:])
+            for name_, mod in curr_mod.named_children():
+                if module_name == name_:
+                    self.set_param(mod, rest, param)
+                    break
+        else:
+            setattr(curr_mod, name, param)
+
+    def detach_params(self):
+        for name, param in self.named_params(self):
+            self.set_param(self, name, param.detach())
+
+# ===================================================================
+# 已移除 MetaConv2d, ResNet101_Backbone, 和 NeighborhoodCrossAttentionFusion 类
+# 因为它们只被已移除的图像分支所使用。
+# ===================================================================
+
+@MODELS.register_module()
+class UniDet3D_Meta(MetaModule, Base3DDetector):
+    r"""UniDet3D_Meta 的精简版本，用于消融实验。
+    此版本完全移除了独立的图像分支和交叉注意力融合模块。
     """
     def __init__(self,
                  in_channels,
@@ -73,6 +121,7 @@ class UniDet3D(Base3DDetector):
                  train_cfg=None,
                  test_cfg=None,
                  data_preprocessor=None,
+                 # 关键改动：移除了 image_backbone_cfg 参数
                  init_cfg=None):
         super(Base3DDetector, self).__init__(
             data_preprocessor=data_preprocessor, init_cfg=init_cfg)
@@ -90,6 +139,9 @@ class UniDet3D(Base3DDetector):
         self.test_cfg = test_cfg
         self.use_sync_bn = use_sync_bn
         self.fast_nms = fast_nms
+        
+        # 关键改动：移除了 image_backbone 和 cross_modal_fusion 的初始化
+        
         self._init_layers(in_channels, num_channels)
     
     def _init_layers(self, in_channels, num_channels):
@@ -111,49 +163,25 @@ class UniDet3D(Base3DDetector):
                 torch.nn.ReLU(inplace=True))
 
     def extract_feat(self, x, superpoints, inverse_mapping, batch_offsets):
-        """Extract features from sparse tensor.
-
-        Args:
-            x (SparseTensor): Input sparse tensor of shape
-                (n_points, in_channels).
-            superpoints (Tensor): of shape (n_points,).
-            inverse_mapping (Tesnor): of shape (n_points,).
-            batch_offsets (List[int]): of len batch_size + 1.
-
-        Returns:
-            List[Tensor]: of len batch_size,
-                each of shape (n_points_i, n_channels).
         """
+        精简版的特征提取函数，只处理点云数据。
+        移除了 image_input 参数和相关的融合逻辑。
+        """
+        # LiDAR 特征提取
         x = self.input_conv(x)
         x, _ = self.unet(x)
         x = self.output_layer(x)
-        x = scatter_mean(x.features[inverse_mapping], superpoints, dim=0)
-        out = []
+        lidar_feat = scatter_mean(x.features[inverse_mapping], superpoints, dim=0)
+        
+        # 将 LiDAR 特征划分为 batch 内的各样本
+        lidar_feats = []
         for i in range(len(batch_offsets) - 1):
-            out.append(x[batch_offsets[i]: batch_offsets[i + 1]])
-        return out
+            lidar_feats.append(lidar_feat[batch_offsets[i]: batch_offsets[i + 1]])
+        
+        return lidar_feats
 
     def collate(self, points, elastic_points=None):
-        """Collate a batch of points into a sparse tensor.
-
-        Args:
-            points (List[Tensor]): A batch of point tensors. Each tensor
-                should contain points in the format (N, 3 + num_features),
-                where N is the number of points.
-            elastic_points (List[Tensor], optional): A batch of transformed
-                point tensors (if any) after elastic point augmentation. 
-                Defaults to None.
-
-        Returns:
-            Tuple[Tensor, Tensor, Tensor, Tensor]: 
-                - coordinates (Tensor): The sparse tensor coordinates after 
-                quantization and normalization.
-                - features (Tensor): The features corresponding to the points.
-                - inverse_mapping (Tensor): A mapping of points to their 
-                indices in the original tensor.
-                - spatial_shape (Tensor): The spatial shape of the sparse tensor,
-                clipped to the minimum spatial shape.
-        """
+        """Collate a batch of points into a sparse tensor."""
         if elastic_points is None:
             coordinates, features = ME.utils.batch_sparse_collate(
                 [((p[:, :3] - p[:, :3].min(0)[0]) / self.voxel_size,
@@ -175,33 +203,12 @@ class UniDet3D(Base3DDetector):
 
         return coordinates, features, inverse_mapping, spatial_shape
 
-    def _forward(*args, **kwargs):
+    def _forward(self, *args, **kwargs):
         """Implement abstract method of Base3DDetector."""
         pass
 
     def _select_queries(self, x, gt_instances):
-        """Select queries for the training pass.
-
-        Args:
-            x (List[Tensor]): A list of tensors of length `batch_size`, 
-                where each tensor has the shape (n_points_i, n_channels).
-            gt_instances (List[InstanceData_]): A list of ground truth 
-                instances of length `batch_size`, where each instance may 
-                contain:
-                    - labels of shape (n_gts_i,)
-                    - sp_masks of shape (n_gts_i, n_points_i).
-
-        Returns:
-            Tuple[List[Tensor], List[Tensor], List[InstanceData_]]:
-                - queries (List[Tensor]): A list of queries of length 
-                `batch_size`, where each query has the shape 
-                (n_queries_i, n_channels).
-                - sp_centers (List[Tensor]): A list of tensors representing 
-                spatial centers for the selected queries.
-                - updated_gt_instances (List[InstanceData_]): A list of ground 
-                truth instances (same length as `gt_instances`), 
-                each updated with query_masks of shape (n_gts_i, n_queries_i).
-        """
+        """Select queries for the training pass."""
         queries = []
         sp_centers = []
         for i in range(len(x)):
@@ -218,24 +225,7 @@ class UniDet3D(Base3DDetector):
         return queries, sp_centers, gt_instances
 
     def get_bboxes_by_masks(self, masks, points):
-        """Generate 3D bounding boxes from masks.
-
-        Args:
-            masks (Tensor): A tensor of boolean masks, of shape 
-                (n, n_points) indicating which points belong to each object.
-            points (Tensor): A tensor of shape (n_points, 3) representing 
-                the 3D coordinates of the points.
-
-        Returns:
-            DepthInstance3DBoxes: A set of 3D bounding boxes, where each box 
-            is represented as a tensor of shape (6,) containing:
-                - Center coordinates (x, y, z)
-                - Dimensions (width, height, depth)
-            
-            If no masks are provided, an empty `DepthInstance3DBoxes` instance 
-            will be returned.
-
-        """
+        """Generate 3D bounding boxes from masks."""
         boxes = []
         for mask in masks:
             object_points = points[mask]
@@ -256,36 +246,17 @@ class UniDet3D(Base3DDetector):
         return bboxes
     
     def get_gt_inst_masks(self, masks_src):
-        """Create ground truth instance masks.
-        
-        Args:
-            mask_src (Tensor): of shape (n_points, 1).
-        
-        
-        Returns:
-            mask (Tensor): instance masks of shape (n_points, num_inst_obj).
-        """
+        """Create ground truth instance masks."""
         masks = masks_src.clone()
         if torch.sum(masks == -1) != 0:
             masks[masks == -1] = torch.max(masks) + 1
             masks = torch.nn.functional.one_hot(masks)[:, :-1]
         else:
             masks = torch.nn.functional.one_hot(masks)
-
         return masks.bool()
 
     def loss(self, batch_inputs_dict, batch_data_samples, **kwargs):
-        """Calculate losses from a batch of inputs dict and data samples.
-
-        Args:
-            batch_inputs_dict (dict): The model input dict which include
-                `points` key.
-            batch_data_samples (List[:obj:`Det3DDataSample`]): The Data
-                Samples. It includes information such as
-                `gt_instances_3d`.
-        Returns:
-            dict: A dictionary of loss components.
-        """
+        """Calculate losses from a batch of inputs dict and data samples."""
         batch_offsets = [0]
         superpoint_bias = 0
         sp_gt_instances = []
@@ -353,13 +324,15 @@ class UniDet3D(Base3DDetector):
         x = spconv.SparseConvTensor(
             features, coordinates, spatial_shape, len(batch_data_samples))
         sp_pts_masks = torch.hstack(sp_pts_masks)
+        
+        # 关键改动：调用不带 image_input 参数的精简版 extract_feat
         x = self.extract_feat(
-            x, sp_pts_masks, inverse_mapping, batch_offsets)
+            x,sp_pts_masks, inverse_mapping, batch_offsets)
 
         queries, sp_centers_queries, sp_gt_instances = \
                     self._select_queries(x, sp_gt_instances)
-        x = self.decoder(queries, sp_centers_queries, datasets_names)
-        loss = self.criterion(x, sp_gt_instances, datasets_names)
+        x = self.decoder(queries, sp_centers_queries, [self.get_dataset(ds) for ds in [d.lidar_path for d in batch_data_samples]])
+        loss = self.criterion(x, sp_gt_instances, [self.get_dataset(ds) for ds in [d.lidar_path for d in batch_data_samples]])
 
         return loss
 
@@ -369,18 +342,7 @@ class UniDet3D(Base3DDetector):
                 return dataset
 
     def get_targets(self, points, gt_bboxes, topk):
-        """Compute targets for final locations for a single scene.
-
-        Args:
-            points (Tensor): Final locations for level.
-            gt_bboxes (BaseInstance3DBoxes): Ground truth boxes.
-            topk (int): The number of nearest ground truth boxes 
-                to consider for target assignment.
-
-        Returns:
-            Tensor: A tensor indicating which ground truth boxes each 
-                point is assigned to, where the shape is (n_points, n_boxes).        
-        """
+        """Compute targets for final locations for a single scene."""
         float_max = points[0].new_tensor(1e8)
         n_points = len(points)
         n_boxes = len(gt_bboxes)
@@ -409,27 +371,7 @@ class UniDet3D(Base3DDetector):
         return min_dist_condition.T
 
     def predict(self, batch_inputs_dict, batch_data_samples, **kwargs):
-        """Predict results from a batch of inputs and data samples
-                with post-processing.
-
-        Args:
-            batch_inputs_dict (dict): A dictionary containing model inputs, 
-                which must include 'points' key.
-            batch_data_samples (List[:obj:Det3DDataSample]): A list of Data 
-                Samples. Each Data Sample includes information such as
-                superpoints (gt_pts_seg.sp_pts_mask).
-
-        Returns:
-            List[:obj:Det3DDataSample]: Detection results for the input 
-                samples. Each Det3DDataSample contains 'pred_instances_3d' 
-                with the following keys:
-                    - bboxes_3d (Tensor): 3D bounding boxes of detected 
-                    instances, shape (num_instances, 6).
-                    - scores_3d (Tensor): Classification scores for each 
-                    detected instance, shape (num_instances,).
-                    - labels_3d (Tensor): Labels of instances, shape 
-                    (num_instances,).
-        """
+        """Predict results from a batch of inputs and data samples."""
         batch_offsets = [0]
         superpoint_bias = 0
         sp_pts_masks = []
@@ -465,36 +407,17 @@ class UniDet3D(Base3DDetector):
                                             points_src, datasets_names)
         
         for i, data_sample in enumerate(batch_data_samples):
-            bboxes, labels, scores = results_list[i]
-            data_sample.pred_instances_3d = InstanceData_(
-                bboxes_3d=bboxes, scores_3d=scores, labels_3d=labels,
-                points=batch_inputs_dict['points'][0])
+            if i < len(results_list):
+                bboxes, labels, scores = results_list[i]
+                data_sample.pred_instances_3d = InstanceData_(
+                    bboxes_3d=bboxes, scores_3d=scores, labels_3d=labels,
+                    points=batch_inputs_dict['points'][0])
         
         return batch_data_samples
 
     def predict_by_feat(self, out, sp_pts_masks, points, 
                         datasets_names):
-        """Predict bounding boxes and labels from model outputs.
-
-        Args:
-            out (dict): A dictionary containing model outputs with the 
-                following keys:
-                - 'cls_preds': Tensor of shape (n_bboxes, num_classes) 
-                containing classification scores for each point.
-                - 'bboxes': Tensor of shape (n_bboxes, 7) containing 
-                predicted bounding boxes.
-            sp_pts_masks (List[Tensor]): A list of superpoint masks.
-            points (List[Tensor]): A list of point tensors containing 
-                the 3D coordinates of the points being evaluated.
-
-            datasets_names (List[str]): A list of dataset names 
-                corresponding to the input samples.
-
-        Returns:
-            List[Tuple[DepthInstance3DBoxes, Tensor, Tensor]]: A list containing 
-            tuples of predicted bounding boxes and their associated 
-            labels and scores.
-        """
+        """Predict bounding boxes and labels from model outputs."""
         cls_preds = out['cls_preds'][0]
         pred_bboxes = out['bboxes'][0]
         sp_pts_mask = sp_pts_masks[0] 
@@ -507,8 +430,12 @@ class UniDet3D(Base3DDetector):
             num_classes,
             device=scores.device).unsqueeze(0).repeat(
                 len(cls_preds), 1).flatten(0, 1)
-        scores, topk_idx = scores.flatten(0, 1).topk(
-            self.test_cfg.topk_insts, sorted=True)
+        
+        total_scores = scores.numel()
+        k = min(self.test_cfg.topk_insts, total_scores)
+        if k <= 0: return []
+
+        scores, topk_idx = scores.flatten(0, 1).topk(k, sorted=True)
         labels = labels[topk_idx]
 
         topk_idx = torch.div(topk_idx, num_classes, rounding_mode='floor')
@@ -539,35 +466,20 @@ class UniDet3D(Base3DDetector):
 
     def trim_bboxes_by_superpoints(self, sp_pts_mask, point, 
                                    bboxes, labels, scores):
-        """Trim bounding boxes based on superpoint masks.
-
-        Args:
-            sp_pts_mask (Tensor): A boolean tensor indicating the valid points 
-                for each superpoint.
-            point (Tensor): A tensor of shape (n_points, 3) representing the 
-                3D coordinates of the points.
-            bboxes (Tensor): A tensor of predicted bounding boxes, with shape 
-                (n_boxes, 6) or (n_boxes, 7) if yaw is included.
-            labels (Tensor): A tensor of shape (n_boxes,) containing the 
-                predicted labels for each bounding box.
-            scores (Tensor): A tensor of shape (n_boxes,) containing the 
-                classification scores for each bounding box.
-
-        Returns:
-            List[Tuple[DepthInstance3DBoxes, Tensor, Tensor]]: A list 
-                containing a tuple of trimmed bounding boxes, 
-                labels, and scores.
-        """
+        """Trim bounding boxes based on superpoint masks."""
         n_points = point.shape[0]
         n_boxes = bboxes.shape[0]
+        if n_boxes == 0:
+            return [(DepthInstance3DBoxes(bboxes.new_zeros((0, 6)), with_yaw=False, box_dim=6, origin=(0.5, 0.5, 0.5)), labels, scores)]
+
         point = point.unsqueeze(1).expand(n_points, n_boxes, 3)
         if bboxes.shape[1] == 6:
             bboxes = torch.cat(
                 (bboxes, torch.zeros_like(bboxes[:, :1])),
                 dim=1)
-        bboxes = bboxes.unsqueeze(0).expand(n_points, n_boxes, 
+        bboxes_expanded = bboxes.unsqueeze(0).expand(n_points, n_boxes, 
                                             bboxes.shape[1])
-        face_distances = get_face_distances(point, bboxes)
+        face_distances = get_face_distances(point, bboxes_expanded)
 
         inside_bbox = face_distances.min(dim=-1).values > 0
         inside_bbox = inside_bbox.T
@@ -587,30 +499,14 @@ class UniDet3D(Base3DDetector):
         bboxes_min = points_for_min.min(axis=0)[0]
         bboxes_sizes = bboxes_max - bboxes_min
         bboxes_centers = (bboxes_max + bboxes_min) / 2
-        bboxes = torch.hstack((bboxes_centers, bboxes_sizes))
-        bboxes = DepthInstance3DBoxes(bboxes, with_yaw=False, 
+        bboxes_out = torch.hstack((bboxes_centers, bboxes_sizes))
+        bboxes_out = DepthInstance3DBoxes(bboxes_out, with_yaw=False, 
                                       box_dim=6, origin=(0.5, 0.5, 0.5))       
-        return [(bboxes, labels, scores)]
+        return [(bboxes_out, labels, scores)]
 
     def _single_scene_multiclass_nms(self, bboxes, scores, 
                                      labels, fast_nms, iou_thr):
-        """Multi-class nms for a single scene.
-
-        Args:
-            bboxes (Tensor): Predicted bounding boxes of shape (N_boxes, 6) 
-                or (N_boxes, 7), where each box represents (x, y, z, length, 
-                width, height) and optionally yaw.
-            scores (Tensor): Predicted scores for the bounding boxes of 
-                shape (N_boxes,), representing confidence scores.
-            labels (Tensor): Predicted labels for each bounding box, 
-                shape (N_boxes,).
-            fast_nms (bool): Flag indicating whether to use the fast NMS 
-                implementation.
-            iou_thr (float): IoU threshold for NMS to filter overlapping boxes.
-
-        Returns:
-            tuple[Tensor, ...]: Predicted bboxes, scores and labels.
-        """
+        """Multi-class nms for a single scene."""
         classes = labels.unique()
         with_yaw = bboxes.shape[1] == 7
         nms_bboxes, nms_scores, nms_labels = [], [], []
@@ -626,10 +522,10 @@ class UniDet3D(Base3DDetector):
                 nms_ids = nms3d(class_bboxes, class_scores, iou_thr)
             else:
                 if fast_nms:
-                    class_bboxes = torch.cat(
+                    class_bboxes_for_nms = torch.cat(
                         (class_bboxes, torch.zeros_like(class_bboxes[:, :1])),
                         dim=1)
-                    nms_ids = nms3d_normal(class_bboxes, class_scores, iou_thr)
+                    nms_ids = nms3d_normal(class_bboxes_for_nms, class_scores, iou_thr)
                 else:
                     nms_ids = aligned_3d_nms(_bbox_to_loss(class_bboxes), 
                                 class_scores, class_labels, iou_thr)
@@ -650,16 +546,7 @@ class UniDet3D(Base3DDetector):
         return nms_bboxes, nms_scores, nms_labels
 
 def get_face_distances(points: Tensor, boxes: Tensor) -> Tensor:
-    """Calculate distances from point to box faces.
-
-    Args:
-        points (Tensor): Final locations of shape (N_points, N_boxes, 3).
-        boxes (Tensor): 3D boxes of shape (N_points, N_boxes, 7)
-
-    Returns:
-        Tensor: Face distances of shape (N_points, N_boxes, 6),
-        (dx_min, dx_max, dy_min, dy_max, dz_min, dz_max).
-    """
+    """Calculate distances from point to box faces."""
     shift = torch.stack(
         (points[..., 0] - boxes[..., 0], points[..., 1] - boxes[..., 1],
             points[..., 2] - boxes[..., 2]),
@@ -675,3 +562,20 @@ def get_face_distances(points: Tensor, boxes: Tensor) -> Tensor:
     dz_max = boxes[..., 2] + boxes[..., 5] / 2 - centers[..., 2]
     return torch.stack((dx_min, dx_max, dy_min, dy_max, dz_min, dz_max),
                         dim=-1)
+
+# Meta-Learning 训练接口
+def meta_train_step(model: UniDet3D_Meta, support_set, query_set, lr_inner):
+    original_params = {name: param.clone() for name, param in model.named_params()}
+    loss_support = model.compute_loss(support_set)
+    grads = torch.autograd.grad(loss_support, model.parameters(), create_graph=True)
+    model.update_params(lr_inner, first_order=False, source_params=grads)
+    loss_query = model.compute_loss(query_set)
+    for name, param in model.named_params():
+        model.set_param(model, name, original_params[name])
+    return loss_query
+
+def compute_loss_example(model: UniDet3D_Meta, batch):
+    batch_inputs_dict, batch_data_samples = batch
+    loss = model.loss(batch_inputs_dict, batch_data_samples)
+    return loss
+

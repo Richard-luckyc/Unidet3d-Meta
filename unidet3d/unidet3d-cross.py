@@ -1,4 +1,5 @@
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 import spconv.pytorch as spconv
 from torch_scatter import scatter_mean
@@ -17,8 +18,219 @@ from mmdet3d.structures import rotation_3d_in_axis
 from .criterion import _bbox_to_loss
 from .structures import InstanceData_
 
+# Meta Learning
+from torch.autograd import Variable
+import torch.nn.init as init
+def to_var(x, requires_grad=True):
+    if torch.cuda.is_available():
+        x = x.cuda()
+    return Variable(x, requires_grad=requires_grad)
+
+class MetaModule(nn.Module):
+    def params(self):
+        for name, param in self.named_params(self):
+            yield param
+
+    def named_leaves(self):
+        return []
+
+    def named_submodules(self):
+        return []
+
+    def named_params(self, curr_module=None, memo=None, prefix=''):
+        if memo is None:
+            memo = set()
+        if curr_module is None:
+            curr_module = self
+        if hasattr(curr_module, 'named_leaves'):
+            for name, p in curr_module.named_leaves():
+                if p is not None and p not in memo:
+                    memo.add(p)
+                    yield prefix + ('.' if prefix else '') + name, p
+        else:
+            for name, p in curr_module._parameters.items():
+                if p is not None and p not in memo:
+                    memo.add(p)
+                    yield prefix + ('.' if prefix else '') + name, p
+        for mname, module in curr_module.named_children():
+            submodule_prefix = prefix + ('.' if prefix else '') + mname
+            for name, p in self.named_params(module, memo, submodule_prefix):
+                yield name, p
+
+    def update_params(self, lr_inner, first_order=False, source_params=None, detach=False):
+        if source_params is not None:
+            for tgt, grad in zip(self.named_params(self), source_params):
+                name_t, param_t = tgt
+                if first_order:
+                    grad = to_var(grad.detach().data)
+                if grad is not None:
+                    tmp = param_t - lr_inner * grad
+                    self.set_param(self, name_t, tmp)
+        else:
+            for name, param in self.named_params(self):
+                if not detach:
+                    grad = param.grad
+                    if first_order:
+                        grad = to_var(grad.detach().data)
+                    tmp = param - lr_inner * grad
+                    self.set_param(self, name, tmp)
+                else:
+                    param = param.detach_()
+                    self.set_param(self, name, param)
+
+    def set_param(self, curr_mod, name, param):
+        if '.' in name:
+            n = name.split('.')
+            module_name = n[0]
+            rest = '.'.join(n[1:])
+            for name_, mod in curr_mod.named_children():
+                if module_name == name_:
+                    self.set_param(mod, rest, param)
+                    break
+        else:
+            setattr(curr_mod, name, param)
+
+    def detach_params(self):
+        for name, param in self.named_params(self):
+            self.set_param(self, name, param.detach())
+
+# 以 MetaModule 为基础实现 MetaConv2d
+class MetaConv2d(MetaModule):
+    def __init__(self, *args, **kwargs):
+        super().__init__()
+        conv = nn.Conv2d(*args, **kwargs)
+        self.in_channels = conv.in_channels
+        self.out_channels = conv.out_channels
+        self.stride = conv.stride
+        self.padding = conv.padding
+        self.dilation = conv.dilation
+        self.groups = conv.groups
+        self.kernel_size = conv.kernel_size
+
+        self.register_buffer('weight', to_var(conv.weight.data, requires_grad=True))
+        if conv.bias is not None:
+            self.register_buffer('bias', to_var(conv.bias.data, requires_grad=True))
+        else:
+            self.register_buffer('bias', None)
+
+    def forward(self, x):
+        return F.conv2d(x, self.weight, self.bias, self.stride, self.padding, self.dilation, self.groups)
+
+    def named_leaves(self):
+        return [('weight', self.weight), ('bias', self.bias)]
+
+# 影像分支及融合模块
+import torchvision.models as models
+
+# 我们直接采用 ResNet101 作为图像特征提取 backbone，去掉最后全连接层
+class ResNet101_Backbone(MetaModule):
+    def __init__(self, pretrained=True):
+        super().__init__()
+        resnet = models.resnet101(pretrained=pretrained)
+        # 去掉平均池化和全连接层，只保留 conv1 ~ layer4
+        self.conv1 = resnet.conv1
+        self.bn1 = resnet.bn1
+        self.relu = resnet.relu
+        self.maxpool = resnet.maxpool
+        self.layer1 = resnet.layer1
+        self.layer2 = resnet.layer2
+        self.layer3 = resnet.layer3
+        self.layer4 = resnet.layer4
+
+    def forward(self, x):
+        # 输入 x: [B, 3, H, W]
+        x = self.conv1(x)
+        x = self.bn1(x)
+        x = self.relu(x)
+        x = self.maxpool(x)
+        x = self.layer1(x)
+        x = self.layer2(x)
+        x = self.layer3(x)
+        x = self.layer4(x)
+        return x  # 输出尺寸通常为 [B, C, H', W']
+
+class NeighborhoodCrossAttentionFusion(nn.Module):
+    def __init__(self, embed_dim, num_heads=8, kernel_size=7, dropout=0.1):
+        """
+        Args:
+            embed_dim (int): 融合后的特征维度，与 LiDAR 特征通道数一致。
+            num_heads (int): 多头注意力头数。
+            kernel_size (int): 局部注意力窗口大小（例如 7 表示 7x7）。
+            dropout (float): dropout 概率。
+        """
+        super().__init__()
+        self.embed_dim = embed_dim
+        self.num_heads = num_heads
+        self.kernel_size = kernel_size
+        self.dropout = dropout
+
+        # 投影图像特征到 embed_dim
+        self.img_proj = nn.Conv2d(2048, embed_dim, kernel_size=1)
+        # 交叉注意力：我们不直接调用全局 MultiheadAttention，而是只在局部区域计算
+        # 为了实现局部注意力，可以采用 nn.Unfold 提取局部块，再计算点积注意力
+        self.scale = embed_dim ** -0.5
+        self.out_proj = nn.Conv2d(embed_dim, embed_dim, kernel_size=1)
+        self.norm = nn.LayerNorm(embed_dim)
+        self.ffn = nn.Sequential(
+            nn.Linear(embed_dim, embed_dim * 4),
+            nn.ReLU(inplace=True),
+            nn.Linear(embed_dim * 4, embed_dim)
+        )
+    
+    def forward(self, lidar_feat, image_feat):
+        """
+        Args:
+            lidar_feat: Tensor [B, embed_dim, H, W]，来自 LiDAR 分支的 BEV 特征
+            image_feat: Tensor [B, 2048, H, W]，图像分支的特征（需与 LiDAR 对齐）
+        Returns:
+            fused_feat: Tensor [B, embed_dim, H, W]，融合后的特征
+        """
+        B, C, H, W = lidar_feat.shape
+        # 将图像特征投影到 embed_dim
+        img_feat_proj = self.img_proj(image_feat)  # [B, embed_dim, H, W]
+        print(image_feat)
+        
+        # 提取局部邻域特征（使用 nn.Unfold）
+        pad = self.kernel_size // 2
+        unfold = nn.Unfold(kernel_size=self.kernel_size, padding=pad)
+        # 将动态分支（图像）展开，得到局部块，形状: [B, embed_dim * (kernel_size^2), H*W]
+        img_unfold = unfold(img_feat_proj)  # [B, embed_dim * K*K, L]，L = H*W
+        
+        # 将 LiDAR 特征作为 query，reshape 为 [B, embed_dim, H*W]
+        lidar_flat = lidar_feat.view(B, C, -1)  # [B, embed_dim, L]
+        # 转置为 [B, L, embed_dim]
+        lidar_flat = lidar_flat.permute(0, 2, 1)  # [B, L, embed_dim]
+        # 将展开后的图像特征 reshape 为 [B, L, K*K, embed_dim]
+        K2 = self.kernel_size * self.kernel_size
+        img_unfold = img_unfold.view(B, C, K2, H*W).permute(0, 3, 2, 1)  # [B, L, K*K, embed_dim]
+
+        # 计算 query 与局部 key 的点积注意力
+        # lidar_flat: [B, L, embed_dim]，expand为 [B, L, K*K, embed_dim]
+        query = lidar_flat.unsqueeze(2).expand(-1, -1, K2, -1)
+        # 注意力得分: [B, L, K*K]
+        attn_scores = (query * img_unfold).sum(dim=-1) * self.scale
+        attn_weights = F.softmax(attn_scores, dim=-1)  # [B, L, K*K]
+        attn_weights = attn_weights.unsqueeze(-1)  # [B, L, K*K, 1]
+        # 计算局部融合结果：对局部区域的值加权求和
+        fused = (attn_weights * img_unfold).sum(dim=2)  # [B, L, embed_dim]
+        # 将融合结果 reshape 回 [B, embed_dim, H, W]
+        fused = fused.permute(0, 2, 1).view(B, C, H, W)
+        # 输出融合后的特征通过一个 1x1 卷积
+        fused = self.out_proj(fused)
+        # 残差连接：与原始 LiDAR 特征相加，并进行归一化与前馈
+        fused = fused + lidar_feat
+        # 归一化注意，此处使用 LayerNorm需要先 reshape
+        fused_flat = fused.view(B, C, -1).permute(0, 2, 1)
+        fused_flat = self.norm(fused_flat)
+        fused = fused_flat.permute(0, 2, 1).view(B, C, H, W)
+        # 前馈网络
+        fused_ffn = self.ffn(fused.view(B, C, -1).transpose(1,2))
+        fused_ffn = fused_ffn.transpose(1,2).view(B, C, H, W)
+        fused = fused + fused_ffn
+        return fused
+
 @MODELS.register_module()
-class UniDet3D(Base3DDetector):
+class UniDet3D_Meta(MetaModule,Base3DDetector):
     r"""UniDet3D for unifed 3D object detection.
 
     Args:
@@ -73,6 +285,7 @@ class UniDet3D(Base3DDetector):
                  train_cfg=None,
                  test_cfg=None,
                  data_preprocessor=None,
+                 image_backbone_cfg=None,
                  init_cfg=None):
         super(Base3DDetector, self).__init__(
             data_preprocessor=data_preprocessor, init_cfg=init_cfg)
@@ -90,6 +303,17 @@ class UniDet3D(Base3DDetector):
         self.test_cfg = test_cfg
         self.use_sync_bn = use_sync_bn
         self.fast_nms = fast_nms
+        # 新增图像分支，采用 ResNet101，利用 ResNet101_Backbone 封装
+        if image_backbone_cfg is not None:
+            self.image_backbone = MODELS.build(image_backbone_cfg)
+        else:
+            self.image_backbone = ResNet101_Backbone(pretrained=True)
+        # 融合模块：假设我们将 LiDAR 特征投影到 BEV 后尺寸与图像特征一致
+        # 这里假设 LiDAR 输出 channels = num_channels, 图像分支输出 channels = 2048（ResNet101 layer4 的输出）
+        self.cross_modal_fusion = NeighborhoodCrossAttentionFusion(embed_dim=num_channels,
+                                                                   num_heads=8,
+                                                                   kernel_size=7,
+                                                                   dropout=0.1)
         self._init_layers(in_channels, num_channels)
     
     def _init_layers(self, in_channels, num_channels):
@@ -110,7 +334,7 @@ class UniDet3D(Base3DDetector):
                 torch.nn.BatchNorm1d(num_channels, eps=1e-4, momentum=0.1),
                 torch.nn.ReLU(inplace=True))
 
-    def extract_feat(self, x, superpoints, inverse_mapping, batch_offsets):
+    def extract_feat(self, x, superpoints, inverse_mapping, batch_offsets,image_input=None):
         """Extract features from sparse tensor.
 
         Args:
@@ -124,14 +348,43 @@ class UniDet3D(Base3DDetector):
             List[Tensor]: of len batch_size,
                 each of shape (n_points_i, n_channels).
         """
+        #LiDAR 特征提取
         x = self.input_conv(x)
         x, _ = self.unet(x)
         x = self.output_layer(x)
-        x = scatter_mean(x.features[inverse_mapping], superpoints, dim=0)
-        out = []
+        lidar_feat = scatter_mean(x.features[inverse_mapping], superpoints, dim=0)
+        # 将 LiDAR 特征划分为 batch 内的各样本
+        lidar_feats = []
         for i in range(len(batch_offsets) - 1):
-            out.append(x[batch_offsets[i]: batch_offsets[i + 1]])
-        return out
+            lidar_feats.append(lidar_feat[batch_offsets[i]: batch_offsets[i + 1]])
+        
+        # 如果提供了图像输入，则进行图像特征提取与融合
+        if image_input is not None and hasattr(self,'image_backbone'):
+            # 提取图像特征：输出尺寸通常为 [B, 2048, H_img, W_img]
+            image_feats = self.image_backbone(image_input)
+            # 假设已有一个投影模块将 LiDAR 特征转换为 2D 格式，与图像特征尺寸对齐
+            # 此处简单模拟，将每个超点特征 reshape 成 2D 格式
+            # 注意：实际中需要设计投影模块，这里仅作示例
+            B = image_feats.shape[0]
+            # 假设每个样本对应一个特征图尺寸 H_img x W_img，且 H_img * W_img == lidar_feats[i].shape[0]
+            fused_feats = []
+            for i in range(B):
+                lidar_feat_i = lidar_feats[i]  # [N_i, C]
+                # 将 lidar_feat_i reshape 成 [1, C, H_img, W_img]
+                # 此处假设 H_img, W_img 已知（例如通过配置传入），这里简单用 sqrt 估计
+                N_i = lidar_feat_i.shape[0]
+                H_img = W_img = int(N_i**0.5)
+                lidar_2d = lidar_feat_i.transpose(0,1).view(1, -1, H_img, W_img)
+                # 对图像特征取对应样本
+                image_feat_i = image_feats[i].unsqueeze(0)  # [1, 2048, H_img, W_img]
+                # 融合
+                fused_2d = self.cross_modal_fusion(lidar_2d, image_feat_i)
+                # 将融合后的 2D 特征 reshape 回 [N_i, C]
+                fused_1d = fused_2d.view(fused_2d.shape[1], -1).transpose(0,1)
+                fused_feats.append(fused_1d)
+            lidar_feats = fused_feats
+        
+        return lidar_feats
 
     def collate(self, points, elastic_points=None):
         """Collate a batch of points into a sparse tensor.
@@ -354,12 +607,12 @@ class UniDet3D(Base3DDetector):
             features, coordinates, spatial_shape, len(batch_data_samples))
         sp_pts_masks = torch.hstack(sp_pts_masks)
         x = self.extract_feat(
-            x, sp_pts_masks, inverse_mapping, batch_offsets)
+            x,sp_pts_masks, inverse_mapping, batch_offsets,image_input=batch_inputs_dict.get('images', None))
 
         queries, sp_centers_queries, sp_gt_instances = \
                     self._select_queries(x, sp_gt_instances)
-        x = self.decoder(queries, sp_centers_queries, datasets_names)
-        loss = self.criterion(x, sp_gt_instances, datasets_names)
+        x = self.decoder(queries, sp_centers_queries, [self.get_dataset(ds) for ds in [d.lidar_path for d in batch_data_samples]])
+        loss = self.criterion(x, sp_gt_instances, [self.get_dataset(ds) for ds in [d.lidar_path for d in batch_data_samples]])
 
         return loss
 
@@ -675,3 +928,18 @@ def get_face_distances(points: Tensor, boxes: Tensor) -> Tensor:
     dz_max = boxes[..., 2] + boxes[..., 5] / 2 - centers[..., 2]
     return torch.stack((dx_min, dx_max, dy_min, dy_max, dz_min, dz_max),
                         dim=-1)
+# Meta-Learning 训练接口
+def meta_train_step(model: UniDet3D_Meta, support_set, query_set, lr_inner):
+    original_params = {name: param.clone() for name, param in model.named_params()}
+    loss_support = model.compute_loss(support_set)
+    grads = torch.autograd.grad(loss_support, model.parameters(), create_graph=True)
+    model.update_params(lr_inner, first_order=False, source_params=grads)
+    loss_query = model.compute_loss(query_set)
+    for name, param in model.named_params():
+        model.set_param(model, name, original_params[name])
+    return loss_query
+
+def compute_loss_example(model: UniDet3D_Meta, batch):
+    batch_inputs_dict, batch_data_samples = batch
+    loss = model.loss(batch_inputs_dict, batch_data_samples)
+    return loss

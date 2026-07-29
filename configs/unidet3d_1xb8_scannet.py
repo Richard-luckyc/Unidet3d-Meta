@@ -52,7 +52,7 @@ model = dict(
         return_blocks=True),
     decoder=dict(
         type='UniDet3DEncoder',
-        num_layers=9,#原参数为6，修改为9
+        num_layers=6,#原参数为6，修改为9
         datasets_classes=[classes_scannet],
         in_channels=num_channels,
         d_model=256,
@@ -704,7 +704,7 @@ val_dataloader = dict(
 
 test_dataloader = val_dataloader
 
-load_from = 'autodl-tmp/work_dirs/tmp/oneformer3d_1xb4_scannet.pth'
+load_from = 'autodl-tmp/work_dirs/tmp/epoch_880.pth'
 
 test_evaluator = dict(type='IndoorMetric_', 
                       datasets=['scannet'],
@@ -714,7 +714,7 @@ val_evaluator = test_evaluator
 
 optim_wrapper = dict(
     type='OptimWrapper',
-    optimizer=dict(type='AdamW', lr=0.0001 * 2, weight_decay=0.05),
+    optimizer=dict(type='AdamW', lr=0.0001 * 2, weight_decay=0.05),#四卡
     clip_grad=dict(max_norm=10, norm_type=2))
 
 param_scheduler = dict(type='PolyLR', begin=0, end=1024, power=0.9)

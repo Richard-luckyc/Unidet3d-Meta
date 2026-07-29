@@ -1,5 +1,4 @@
 from .unidet3d import UniDet3D_Meta
-#from .unidet3d import UniDet3D#临时修改
 from .spconv_unet import SpConvUNet
 from .encoder import UniDet3DEncoder
 from .criterion import UniDet3DCriterion
@@ -18,3 +17,4 @@ from .axis_aligned_iou_loss import UniDet3DAxisAlignedIoULoss
 from .rotated_iou_loss import UniDet3DRotatedIoU3DLoss
 from .indoor_metric import IndoorMetric_
 from .concat_dataset import ConcatDataset_
+from .lum_vit import LUM_ViT

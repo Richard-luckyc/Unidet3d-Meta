@@ -78,6 +78,9 @@ To visualize ground truth and predicted boxes, run the [testing](tools/test.py) 
 python tools/test.py configs/unidet3d_1xb8_scannet_s3dis_multiscan_3rscan_scannetpp_arkitscenes.py \
     work_dirs/unidet3d_1xb8_scannet_s3dis_multiscan_3rscan_scannetpp_arkitscenes/latest.pth --show \
     --show-dir work_dirs/unidet3d_1xb8_scannet_s3dis_multiscan_3rscan_scannetpp_arkitscenes
+python tools/test.py configs/unidet3d_1xb8_scannet.py \
+    work_dirs/unidet3d_1xb8_scannet/epoch_1.pth --show \
+    --show-dir work_dirs/unidet3d_1xb8_scannet
 ```
 You can also set `score_thr` in configs to `0.3` for better visualizations.
 

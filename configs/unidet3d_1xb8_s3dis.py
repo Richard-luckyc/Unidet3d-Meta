@@ -164,8 +164,8 @@ default_hooks = dict(
 # --- 训练循环设置 (保持不变) ---
 train_cfg = dict(
     type='EpochBasedTrainLoop',
-    max_epochs=128, # 可调整,原文为1024
-    dynamic_intervals=[(1, 16), (128 - 16, 1)]) # 可调整验证频率
+    max_epochs=96, # 可调整,原文为1024
+    dynamic_intervals=[(1, 8), (160 - 8, 1)]) # 可调整验证频率
 val_cfg = dict(type='ValLoop')
 test_cfg = dict(type='TestLoop')
 # --- 训练、验证、测试设置结束 ---
