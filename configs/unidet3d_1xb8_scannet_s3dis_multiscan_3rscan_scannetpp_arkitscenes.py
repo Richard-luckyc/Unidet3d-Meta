@@ -35,7 +35,7 @@ num_channels=32
 voxel_size=0.02
 
 model = dict(
-    type='UniDet3D_Meta',
+    type='ACMC3D',
     data_preprocessor=dict(type='Det3DDataPreprocessor_'),
     in_channels=6,
     num_channels=num_channels,
