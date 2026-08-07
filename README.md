@@ -2,7 +2,7 @@
 
 ### Main Results
 
-We evaluate UniDet3D-Meta on six challenging indoor 3D object detection benchmarks. As shown below, our method achieves **state-of-the-art performance** across nearly all datasets. Notably, compared to the strong baseline UniDet3D, our method brings remarkable improvements on **S3DIS** (+2.2/+8.4 mAP), **MultiScan** (+5.7/+8.4 mAP), and **3RScan** (+3.0/+4.1 mAP) in the best-result setting, with consistent gains on ScanNet and ARKitScenes as well. These results demonstrate the effectiveness of our approach in enhancing detection robustness and minority-class recognition. Averaged over 25 independent trials, UniDet3D-Meta still outperforms all competitors by a clear margin, validating the stability of our improvements.
+We evaluate ACMC3D on six challenging indoor 3D object detection benchmarks. As shown below, our method achieves **state-of-the-art performance** across nearly all datasets. Notably, compared to the strong baseline UniDet3D, our method brings remarkable improvements on **S3DIS** (+2.2/+8.4 mAP), **MultiScan** (+5.7/+8.4 mAP), and **3RScan** (+3.0/+4.1 mAP) in the best-result setting, with consistent gains on ScanNet and ARKitScenes as well. These results demonstrate the effectiveness of our approach in enhancing detection robustness and minority-class recognition. Averaged over 25 independent trials, ACMC3D still outperforms all competitors by a clear margin, validating the stability of our improvements.
 
 #### Best Result
 
@@ -15,7 +15,7 @@ We evaluate UniDet3D-Meta on six challenging indoor 3D object detection benchmar
 | TR3D | 72.9 | 59.3 | - | - | 74.5 | 51.7 | 56.7 | 42.3 | 62.3 | 45.4 | 26.2 | 14.5 |
 | SPGroup3D | 74.3 | 59.6 | - | - | 69.2 | 47.2 | - | - | - | - | - | - |
 | UniDet3D | 77.9 | 66.1 | 61.3 | 47.1 | 75.2 | 60.8 | 64.2 | 51.6 | 64.7 | 48.6 | **26.4** | 17.2 |
-| **UniDet3D-Meta** | **78.5** | **67.1** | **62.5** | **49.3** | **77.4** | **69.2** | **69.9** | **60.0** | **67.7** | **52.7** | 25.0 | **17.9** |
+| **ACMC3D** | **78.5** | **67.1** | **62.5** | **49.3** | **77.4** | **69.2** | **69.9** | **60.0** | **67.7** | **52.7** | 25.0 | **17.9** |
 
 #### Average across 25 trials
 
@@ -26,9 +26,9 @@ We evaluate UniDet3D-Meta on six challenging indoor 3D object detection benchmar
 | SPGroup3D | 74.5 | 60.3 | - | - | 67.7 | 43.6 | - | - | - | - | - | - |
 | CAGroup3D | 76.8 | 64.5 | - | - | - | - | - | - | - | - | - | - |
 | UniDet3D | 77.1 | 65.2 | 60.2 | 46.0 | 73.3 | 57.9 | 62.4 | 50.8 | 62.1 | 45.6 | **24.4** | 16.3 |
-| **UniDet3D-Meta** | **77.9** | **65.6** | **61.2** | **48.1** | **75.5** | **65.4** | **68.3** | **58.5** | **66.1** | **50.2** | 23.7 | **17.2** |
+| **ACMC3D** | **77.9** | **65.6** | **61.2** | **48.1** | **75.5** | **65.4** | **68.3** | **58.5** | **66.1** | **50.2** | 23.7 | **17.2** |
 
 > **Key Observations:**
-> - **Best-result setting**: UniDet3D-Meta achieves the highest mAP on six datasets, with particularly large gains on S3DIS, MultiScan, and 3RScan.
+> - **Best-result setting**: ACMC3D achieves the highest mAP on six datasets, with particularly large gains on S3DIS, MultiScan, and 3RScan.
 > - **25-trial average**: Consistent improvements across all datasets demonstrate the stability and robustness of our method.
 > - The significant boost in mAP₅₀ indicates enhanced precision for minority-class detection, validating our motivation.
