@@ -1,4 +1,4 @@
-from .unidet3d import UniDet3D_Meta
+from .unidet3d import ACMC3D
 from .spconv_unet import SpConvUNet
 from .encoder import UniDet3DEncoder
 from .criterion import UniDet3DCriterion
